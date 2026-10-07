@@ -1,0 +1,323 @@
+#!/bin/bash
+#
+# godark -- one switch on the Omarchy bar that cuts every radio and network
+# link, and puts back exactly what was on before.
+#
+# Sibling of macarchy (https://github.com/SalimRK/macarchy): one script,
+# dispatched by subcommand, run straight from the plugin checkout as the
+# user. Nothing here ever runs as root, and nothing elevates at all:
+#
+#   - radios go through `rfkill`, which an active local session can drive
+#     because systemd's stock 70-uaccess.rules grants it an ACL on
+#     /dev/rfkill;
+#   - wired and everything else NetworkManager runs goes through
+#     `nmcli networking`, which NM's stock polkit policy allows for an
+#     active local session (allow_active=yes).
+#
+# Over ssh or from an inactive session neither holds, and the commands
+# fail with the tool's own error instead of prompting.
+#
+# Going dark survives a reboot: systemd-rfkill and NetworkManager both
+# persist their state. So does the snapshot of what was on before, which
+# is why it lives under $XDG_STATE_HOME rather than /run.
+
+set -uo pipefail
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+umask 077
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/godark"
+SNAPSHOT="$STATE_DIR/state"
+LOCK="$STATE_DIR/lock"
+
+# rfkill device names (phy0, hci0, dell-wifi, ...) and types. Anything else
+# read back from the snapshot is ignored rather than trusted.
+NAME_RE='^[A-Za-z0-9_.:-]+$'
+
+# Radios that the no-snapshot fallback in `light` turns back on. Bluetooth,
+# nfc, gps and uwb stay off: guessing wrong there turns on a radio someone
+# deliberately had off, which is the one thing this tool promises not to do.
+FALLBACK_TYPES=" wlan wwan "
+
+die() { echo "godark: $*" >&2; exit 1; }
+warn() { echo "godark: $*" >&2; }
+
+have_nm() {
+  command -v nmcli >/dev/null 2>&1 && nmcli -t networking >/dev/null 2>&1
+}
+
+# "enabled" | "disabled" | "absent" (no NetworkManager running).
+networking_state() {
+  local s
+  have_nm || { echo absent; return; }
+  s=$(nmcli -t networking 2>/dev/null)
+  case $s in
+  enabled | disabled) echo "$s" ;;
+  *) echo absent ;;
+  esac
+}
+
+# One line per radio: "<id> <type> <device> <soft> <hard>". IDs are only
+# good for this boot; matching across reboots uses type + device.
+radios() {
+  rfkill -rn -o ID,TYPE,DEVICE,SOFT,HARD 2>/dev/null
+}
+
+# Physical interfaces that are up but that NetworkManager doesn't manage,
+# so `nmcli networking off` can't cut them. Taking them down would need
+# root; GoDark reports them instead.
+uncovered_interfaces() {
+  local path iface oper nmstate
+  for path in /sys/class/net/*; do
+    iface=${path##*/}
+    [[ -e $path/device ]] || continue
+    oper=$(<"$path/operstate")
+    [[ $oper == up ]] || continue
+    # Radios rfkill already covers.
+    [[ -e $path/phy80211 ]] && continue
+    nmstate=""
+    have_nm && nmstate=$(nmcli -t -f DEVICE,STATE device status 2>/dev/null | awk -F: -v d="$iface" '$1==d{print $2}')
+    if [[ -z $nmstate || $nmstate == unmanaged ]]; then
+      printf '%s\n' "$iface"
+    fi
+  done
+}
+
+all_radios_off() {
+  local id type dev soft hard
+  while read -r id type dev soft hard; do
+    [[ -n $id ]] || continue
+    [[ $soft == blocked || $hard == blocked ]] || return 1
+  done < <(radios)
+  return 0
+}
+
+# "dark" | "partial" | "light", always from live state. The snapshot only
+# tells a half-restored machine (partial) apart from a normal one (light).
+current_state() {
+  local net
+  net=$(networking_state)
+  if [[ $net != enabled ]] && all_radios_off; then
+    echo dark
+  elif [[ -f $SNAPSHOT ]]; then
+    echo partial
+  else
+    echo light
+  fi
+}
+
+with_lock() {
+  mkdir -p "$STATE_DIR" || die "cannot create $STATE_DIR"
+  exec 9>"$LOCK" || die "cannot open $LOCK"
+  flock -w 10 9 || die "another godark command is still running"
+}
+
+# Written before anything is cut, atomically, so a crash can never leave a
+# half-written snapshot behind.
+write_snapshot() {
+  local tmp id type dev soft hard
+  tmp=$(mktemp "$STATE_DIR/state.XXXXXX") || return 1
+  {
+    echo "version=1"
+    echo "saved=$(date -Iseconds)"
+    echo "networking=$(networking_state)"
+    while read -r id type dev soft hard; do
+      [[ -n $id ]] || continue
+      [[ $type =~ $NAME_RE && $dev =~ $NAME_RE ]] || continue
+      echo "radio=$type $dev $soft"
+    done < <(radios)
+  } >"$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$SNAPSHOT" || { rm -f "$tmp"; return 1; }
+}
+
+snapshot_saved() {
+  [[ -f $SNAPSHOT ]] || return 1
+  sed -n 's/^saved=//p' "$SNAPSHOT" | head -1
+}
+
+radio_id() {
+  local want_type="$1" want_dev="$2" id type dev soft hard
+  while read -r id type dev soft hard; do
+    if [[ $type == "$want_type" && $dev == "$want_dev" ]]; then
+      echo "$id"
+      return 0
+    fi
+  done < <(radios)
+  return 1
+}
+
+radio_hard() {
+  rfkill -rn -o HARD "$1" 2>/dev/null
+}
+
+cut_everything() {
+  local id type dev soft hard failed=0
+  if [[ $(networking_state) == enabled ]]; then
+    nmcli networking off || { warn "NetworkManager refused to turn networking off"; failed=1; }
+  fi
+  while read -r id type dev soft hard; do
+    [[ -n $id ]] || continue
+    [[ $soft == blocked ]] && continue
+    rfkill block "$id" || { warn "could not block $type $dev"; failed=1; }
+  done < <(radios)
+  return "$failed"
+}
+
+cmd_dark() {
+  with_lock
+  if [[ -f $SNAPSHOT ]]; then
+    # Already dark, or partly back: re-cut, but keep the snapshot taken
+    # when the machine was last really on. Overwriting it here would save
+    # "everything off" as the state to come back to.
+    [[ $(current_state) == dark ]] && { echo "Already dark."; return 0; }
+  else
+    write_snapshot || die "could not save the current state; nothing was cut"
+  fi
+  cut_everything || die "went partly dark; run \`godark dark\` again or \`godark light\` to undo"
+  echo "Dark. Every radio and network link is off."
+}
+
+restore_from_snapshot() {
+  local key value type dev soft id net="" failed=0
+  while IFS='=' read -r key value; do
+    case $key in
+    networking) net=$value ;;
+    radio)
+      read -r type dev soft <<<"$value"
+      [[ $type =~ $NAME_RE && $dev =~ $NAME_RE ]] || continue
+      [[ $soft == unblocked ]] || continue
+      if ! id=$(radio_id "$type" "$dev"); then
+        warn "$type $dev is gone (unplugged?); skipped"
+        continue
+      fi
+      rfkill unblock "$id" || { warn "could not unblock $type $dev"; failed=1; continue; }
+      [[ $(radio_hard "$id") == blocked ]] && warn "$type $dev is held off by a hardware switch"
+      ;;
+    esac
+  done <"$SNAPSHOT"
+  if [[ $net == enabled && $(networking_state) == disabled ]]; then
+    nmcli networking on || { warn "NetworkManager refused to turn networking on"; failed=1; }
+  fi
+  return "$failed"
+}
+
+# No snapshot, but the machine is dark (deleted file, new home, someone
+# went dark by hand). Bring back the links people expect -- networking,
+# wifi, mobile -- and leave the rest off.
+restore_fallback() {
+  local id type dev soft hard failed=0
+  while read -r id type dev soft hard; do
+    [[ -n $id ]] || continue
+    [[ $FALLBACK_TYPES == *" $type "* && $soft == blocked ]] || continue
+    rfkill unblock "$id" || { warn "could not unblock $type $dev"; failed=1; }
+    [[ $hard == blocked ]] && warn "$type $dev is held off by a hardware switch"
+  done < <(radios)
+  if [[ $(networking_state) == disabled ]]; then
+    nmcli networking on || { warn "NetworkManager refused to turn networking on"; failed=1; }
+  fi
+  return "$failed"
+}
+
+cmd_light() {
+  with_lock
+  if [[ -f $SNAPSHOT ]]; then
+    restore_from_snapshot || die "restored partly; the snapshot is kept, run \`godark light\` again"
+    rm -f "$SNAPSHOT"
+    echo "Back to how it was."
+  elif [[ $(current_state) == dark ]]; then
+    restore_fallback || die "could not restore everything"
+    echo "No saved state, so turned on networking, wifi and mobile only."
+    echo "Bluetooth and other radios stay off; turn them on yourself if you want them."
+  else
+    echo "Not dark; nothing to restore."
+  fi
+}
+
+cmd_toggle() {
+  if [[ $(current_state) == dark ]]; then
+    cmd_light
+  else
+    cmd_dark
+  fi
+}
+
+json_str() {
+  local s="$1"
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  printf '"%s"' "$s"
+}
+
+cmd_status() {
+  local json="${1:-}" state net saved id type dev soft hard first=1 iface
+  state=$(current_state)
+  net=$(networking_state)
+  saved=$(snapshot_saved) || saved=""
+
+  if [[ $json == --json ]]; then
+    printf '{\n  "state": %s,\n  "networking": %s,\n  "since": %s,\n  "radios": [' \
+      "$(json_str "$state")" "$(json_str "$net")" "$(json_str "$saved")"
+    while read -r id type dev soft hard; do
+      [[ -n $id ]] || continue
+      (( first )) || printf ','
+      first=0
+      printf '\n    {"type": %s, "device": %s, "soft": %s, "hard": %s}' \
+        "$(json_str "$type")" "$(json_str "$dev")" "$(json_str "$soft")" "$(json_str "$hard")"
+    done < <(radios)
+    printf '\n  ],\n  "uncovered": ['
+    first=1
+    while IFS= read -r iface; do
+      [[ -n $iface ]] || continue
+      (( first )) || printf ', '
+      first=0
+      json_str "$iface"
+    done < <(uncovered_interfaces)
+    printf ']\n}\n'
+    return 0
+  fi
+
+  echo "state: $state${saved:+ (since $saved)}"
+  echo "networking: $net"
+  while read -r id type dev soft hard; do
+    [[ -n $id ]] || continue
+    if [[ $hard == blocked ]]; then
+      echo "$type $dev: hard-blocked (hardware switch)"
+    else
+      echo "$type $dev: $soft"
+    fi
+  done < <(radios)
+  while IFS= read -r iface; do
+    [[ -n $iface ]] && echo "$iface: up, not managed by NetworkManager -- GoDark can't cut it"
+  done < <(uncovered_interfaces)
+}
+
+cmd_help() {
+  cat <<USAGE
+godark -- cut every radio and network link, then put back exactly what was
+on before.
+
+  status [--json]   dark / partial / light, every radio, networking.
+  dark              Save what's on, then cut it all.
+  light             Put back exactly what was saved.
+  toggle            dark if not dark, otherwise light.
+
+Never run this with sudo; it needs none. Radios go through rfkill and
+wired links through NetworkManager, both allowed for your active session.
+USAGE
+}
+
+(( EUID != 0 )) || die "don't run godark as root -- it needs no privileges"
+
+command="${1:-help}"
+shift || true
+
+case "$command" in
+status) cmd_status "$@" ;;
+dark)   cmd_dark ;;
+light)  cmd_light ;;
+toggle) cmd_toggle ;;
+help | -h | --help) cmd_help ;;
+*)      cmd_help >&2; die "unknown command: $command" ;;
+esac

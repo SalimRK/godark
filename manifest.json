@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "id": "oniomarchy.godark",
+  "name": "GoDark",
+  "version": "0.1.0",
+  "author": "cyberbow",
+  "license": "MIT",
+  "description": "One switch on the Omarchy bar that cuts every radio and network link, and restores exactly what was on before.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "GoDark",
+    "description": "Kill switch for wifi, bluetooth, wwan, ethernet and every other link, with exact restore.",
+    "category": "Network",
+    "aliases": [
+      "dark",
+      "airplane",
+      "flight mode",
+      "kill switch",
+      "rfkill",
+      "offline",
+      "privacy",
+      "network"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "center",
+    "defaults": {
+      "refreshIntervalSec": 3
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 1,
+        "max": 300,
+        "step": 1,
+        "defaultValue": 3
+      }
+    ]
+  }
+}
